@@ -388,7 +388,8 @@ static MegaMoEConfig get_mega_moe_config(
     if (fp4_weights and mma_kind == MmaKind::MXFP8FP4 and block_k == 128 and gran_k == 32 and
         arch_caps.has_mxf8f6f4_k64 and deep_jit::get_env<int>("DG_MEGA_MOE_SM107_K64", 1) != 0) {
         umma_k = 64;
-    } else if ((mma_kind == MmaKind::NVFP4 or mma_kind == MmaKind::MXFP4) and block_k == 256 and block_m <= 240 and
+    } else if ((mma_kind == MmaKind::NVFP4 or mma_kind == MmaKind::MXFP4) and block_k == 256 and
+               block_m <= (mma_kind == MmaKind::NVFP4 ? 192 : 240) and
                arch_caps.has_fp4_k128 and deep_jit::get_env<int>("DG_MEGA_MOE_SM107_K128", 1) != 0) {
         umma_k = 128;
     } else if (mma_kind == MmaKind::NVFP4 and block_k == 256 and gran_k == 16 and block_m <= 240 and
@@ -396,9 +397,9 @@ static MegaMoEConfig get_mega_moe_config(
         umma_k = 96;
     }
     const bool use_packed_fp4_k64 = (mma_kind == MmaKind::MXFP8FP4 and umma_k == 64);
-    if (mma_kind == MmaKind::NVFP4 and (umma_k == 96 or umma_k == 128) and block_m == 192 and deep_jit::get_env<std::string>("DG_MEGA_MOE_TILES").empty()) {
+    if (mma_kind == MmaKind::NVFP4 and umma_k == 96 and block_m == 192 and deep_jit::get_env<std::string>("DG_MEGA_MOE_TILES").empty()) {
         store_block_m_l1 = 32;
-        store_block_m_l2 = umma_k == 96 ? 8 : 24;
+        store_block_m_l2 = 8;
     }
     // SIMT dispatch pull (normal SMEM budget): on by default on SM107 with packed FP4 weight stages
     // and on SM103 NVFP4 decode (`block_m <= 128`). `DG_MEGA_MOE_SIMT_PULL=0/1` overrides.
