@@ -300,4 +300,18 @@ struct Allocator2Sm {
     }
 };
 
+/// Exclusive 2-CTA allocator (SM107): `num_columns` is any multiple of 32 up to 576
+struct Allocator2SmExclusive {
+    CUTLASS_DEVICE void allocate(const uint32_t& num_columns, uint32_t* dst_ptr) const {
+        asm volatile("tcgen05.alloc.exclusive.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;"
+                     :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(dst_ptr))), "r"(num_columns));
+    }
+    CUTLASS_DEVICE void free(const uint32_t& tmem_ptr, const uint32_t& num_columns) const {
+        asm volatile("tcgen05.dealloc.exclusive.cta_group::2.sync.aligned.b32 %0, %1;" :: "r"(tmem_ptr), "r"(num_columns));
+    }
+    CUTLASS_DEVICE void release_allocation_lock() const {
+        asm volatile("tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned;");
+    }
+};
+
 } // namespace deep_gemm::ptx

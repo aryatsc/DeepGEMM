@@ -181,7 +181,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr bool kUseSitu = kActivation == MegaMoEActivation::SiTU;
     constexpr float kSwiGLUAlpha = kActivation == MegaMoEActivation::SwiGLUOAI ? 1.702f : 0.0f;
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
-    using Allocator = ptx::Allocator2Sm;
 
     // Use one domain when clusters cannot split evenly across device locality domains
     constexpr uint32_t kNumLocalityDomains =
@@ -445,7 +444,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kNumSFATmemCols = SF_BLOCK_M / 32;
     constexpr uint32_t kNumSFBTmemCols = SF_BLOCK_N / 32;
     constexpr uint32_t kNumSFColsPerSlot = kNumSFATmemCols + kNumSFBTmemCols;
-    constexpr uint32_t kFreeTmemCols = 512u - kNumAccumTmemCols;
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1070)
+    constexpr uint32_t kMaxTmemCols = kUseSM107K128 ? 576u : 512u;
+#else
+    constexpr uint32_t kMaxTmemCols = 512u;
+#endif
+    constexpr uint32_t kFreeTmemCols = kMaxTmemCols - kNumAccumTmemCols;
     constexpr uint32_t kNumK96ColsPerSlot = 3u * kNumSFColsPerSlot;
     constexpr uint32_t kMaxK96SFSlots = kFreeTmemCols / kNumK96ColsPerSlot;
     constexpr bool kCanUseSM103K96Base =
@@ -477,10 +481,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         : (kCanUseSM103K96Compact
             ? 32u
             : (kCanUseSM107K128 ? (kNumK128SFSlots * kNumK128ColsPerSlot) : kNumSFColsPerSlot));
-    constexpr uint32_t kNumTmemCols = utils::get_num_aligned_tmem_cols<kNumAccumTmemCols + kNumTotalSFTmemCols>();
+    constexpr uint32_t kRawTmemCols = kNumAccumTmemCols + kNumTotalSFTmemCols;
+    constexpr bool kUseExclusiveTmem = (kRawTmemCols > 512u);
+    constexpr uint32_t kNumTmemCols = kUseExclusiveTmem
+        ? math::constexpr_align<uint32_t>(kRawTmemCols, 32u)
+        : utils::get_num_aligned_tmem_cols<kUseExclusiveTmem ? 512u : kRawTmemCols>();
+    using Allocator = cute::conditional_t<kUseExclusiveTmem, ptx::Allocator2SmExclusive, ptx::Allocator2Sm>;
     constexpr uint32_t kTmemStartColOfSFA = kNumAccumTmemCols;
     constexpr uint32_t kTmemStartColOfSFB = kNumAccumTmemCols + kNumSFATmemCols;
-    DG_STATIC_ASSERT(32 <= kNumTmemCols and kNumTmemCols <= 512, "Invalid tensor memory columns");
+    DG_STATIC_ASSERT(32 <= kNumTmemCols and kNumTmemCols <= kMaxTmemCols, "Invalid tensor memory columns");
 
     // A cluster sync is essential for 2CTA tensor memory allocation
     comm::cluster_sync_with_relaxed_arrive();

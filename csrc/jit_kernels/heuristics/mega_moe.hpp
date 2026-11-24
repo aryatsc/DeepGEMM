@@ -388,8 +388,7 @@ static MegaMoEConfig get_mega_moe_config(
     if (fp4_weights and mma_kind == MmaKind::MXFP8FP4 and block_k == 128 and gran_k == 32 and
         arch_caps.has_mxf8f6f4_k64 and deep_jit::get_env<int>("DG_MEGA_MOE_SM107_K64", 1) != 0) {
         umma_k = 64;
-    } else if ((mma_kind == MmaKind::NVFP4 or mma_kind == MmaKind::MXFP4) and block_k == 256 and
-               block_m <= (mma_kind == MmaKind::NVFP4 ? 192 : 240) and
+    } else if ((mma_kind == MmaKind::NVFP4 or mma_kind == MmaKind::MXFP4) and block_k == 256 and block_m <= 240 and
                arch_caps.has_fp4_k128 and deep_jit::get_env<int>("DG_MEGA_MOE_SM107_K128", 1) != 0) {
         umma_k = 128;
     } else if (mma_kind == MmaKind::NVFP4 and block_k == 256 and gran_k == 16 and block_m <= 240 and
