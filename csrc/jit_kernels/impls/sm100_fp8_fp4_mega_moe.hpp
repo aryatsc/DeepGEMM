@@ -220,7 +220,7 @@ static void sm100_fp8_fp4_mega_moe(
 
     // SM107 K=64 MMA: routed FP4 weights are loaded packed with 64B swizzle, and the shared expert's activations
     // and FP8 weights are loaded in 64-wide K halves with 64B swizzle
-    const bool use_k64 = config.use_sm107_k64;
+    const bool use_k64 = (mma_kind == MmaKind::MXFP8FP4 and config.umma_k == 64);
     DG_HOST_ASSERT(not use_k64 or (not use_shuffled_weights and config.block_k == 128 and to_inner(config.block_k) == 128));
     const int routed_weights_swizzle_mode = use_k64 ? 64 : config.swizzle_weights_mode;
     const int shared_block_k_inner = use_k64 ? block_k_inner / 2 : block_k_inner;
@@ -375,7 +375,7 @@ static void __instantiate_kernel() {{
         {}, {}, {}, {}, {},
         {}, {},
         {}, {}, {}, {}, {},
-        {}, {}, {}, {}, {}
+        {}, {}, {}, {}
     >);
 }};
 )", num_max_tokens_per_rank,
@@ -406,8 +406,7 @@ static void __instantiate_kernel() {{
     post_expert_norm_weight != nullptr ? "true" : "false",
     to_string(post_norm_eps),
     to_weight_layout_name(weight_layout),
-    config.use_sm107_k64 ? "true" : "false",
-    config.use_sm103_k96 ? "true" : "false",
+    config.umma_k,
     config.use_simt_pull ? "true" : "false",
     config.gran_k,
     broadcast_y ? "true" : "false"));

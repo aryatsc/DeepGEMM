@@ -123,10 +123,8 @@ template <
     bool kPostNormHasWeight = false,
     float kPostNormEps = 0.0f,
     MegaMoEWeightLayout kWeightLayout = MegaMoEWeightLayout::GateUpBlock8,
-    // SM107 only: K=64 `kind::mxf8f6f4` MMAs on packed FP4 routed weights (FP8 x FP4)
-    bool kUseSM107K64 = false,
-    // SM103 only: K=96 `kind::mxf4nvf4.block_scale.block16` Ultra MMAs on NVFP4
-    bool kUseSM103K96 = false,
+    // UMMA K-width: 32/64 for MXF8F6F4 (64 = SM107 packed FP4), 64/96/128 for MXF4/NVF4 (96 = SM103 Ultra, 128 = SM107)
+    uint32_t kUmmaK = 0,
     // SIMT dispatch pull (no SMEM send buffer)
     bool kUseSimtPull = false,
     uint32_t kGranK = get_sf_gran_k(kMmaKind),
@@ -340,6 +338,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // (2 per byte), so the routed FP4 weights are loaded packed (`16U4_ALIGN8B`, 64B swizzle) and a weight
     // stage holds half the bytes. The FP8 shared expert then splits each 128-wide K block into two 64-wide
     // halves of the same 64-byte rows: its SF words still cover 128-wide K, and each half picks its two SFs by ID
+    constexpr bool kUseSM107K64 = (kMmaKind == MmaKind::MXFP8FP4 and kUmmaK == 64u);
+    constexpr bool kUseSM103K96 = (kMmaKind == MmaKind::NVFP4 and kUmmaK == 96u);
+    constexpr bool kUseSM107K128 = ((kMmaKind == MmaKind::NVFP4 or kMmaKind == MmaKind::MXFP4) and kUmmaK == 128u);
     constexpr bool kPackedFP4Weights = kUseSM107K64;
     DG_STATIC_ASSERT(not kPackedFP4Weights or
                      (kMmaKind == MmaKind::MXFP8FP4 and not kIsWeightFP8 and kGranK == 32 and
@@ -454,13 +455,28 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr bool kCanUseSM103K96Compact =
         kCanUseSM103K96Base and (kMaxK96SFSlots == 0u) and (kFreeTmemCols >= 32u) and (kNumSFBTmemCols == 4u);
     constexpr uint32_t kNumK96SFSlots = kCanUseSM103K96 ? cute::min(kMaxK96SFSlots, 4u) : 1u;
+
+    // SM107 K=128 FP4 MMA: 2 MMAs per BLOCK_K=256 stage (no cross-stage grouping).
+    // NVFP4 (block16) consumes 2 SF chunks per MMA; MXFP4 (block32) consumes 1 SF chunk per MMA.
+    constexpr uint32_t kK128ChunksPerMMA = kIsNVFP4 ? 2u : 1u;
+    constexpr uint32_t kNumK128ColsPerSlot = kK128ChunksPerMMA * kNumSFColsPerSlot;
+    constexpr uint32_t kMaxK128SFSlots = kFreeTmemCols / kNumK128ColsPerSlot;
+    constexpr bool kCanUseSM107K128 =
+        kUseSM107K128 and (kIsNVFP4 or kIsMXFP4) and (BLOCK_K == 256u) and
+        (kSwizzleAMode == 128u) and (kSwizzleBMode == 128u) and (kMaxK128SFSlots >= 1u);
+    constexpr uint32_t kNumK128SFSlots = kCanUseSM107K128 ? cute::min(kMaxK128SFSlots, 4u) : 1u;
+
     constexpr uint32_t kMaxSFSlots = kFreeTmemCols / kNumSFColsPerSlot;
     constexpr uint32_t kNumSFTmemSlots = kCanUseSM103K96
         ? (kNumK96SFSlots * 3u)
-        : (kCanUseSM103K96Compact ? cute::min(kMaxSFSlots, 2u) : 1u);
+        : (kCanUseSM103K96Compact
+            ? cute::min(kMaxSFSlots, 2u)
+            : (kCanUseSM107K128 ? (kNumK128SFSlots * kK128ChunksPerMMA) : 1u));
     constexpr uint32_t kNumTotalSFTmemCols = kCanUseSM103K96
         ? (kNumK96SFSlots * kNumK96ColsPerSlot)
-        : (kCanUseSM103K96Compact ? 32u : kNumSFColsPerSlot);
+        : (kCanUseSM103K96Compact
+            ? 32u
+            : (kCanUseSM107K128 ? (kNumK128SFSlots * kNumK128ColsPerSlot) : kNumSFColsPerSlot));
     constexpr uint32_t kNumTmemCols = utils::get_num_aligned_tmem_cols<kNumAccumTmemCols + kNumTotalSFTmemCols>();
     constexpr uint32_t kTmemStartColOfSFA = kNumAccumTmemCols;
     constexpr uint32_t kTmemStartColOfSFB = kNumAccumTmemCols + kNumSFATmemCols;
@@ -1723,6 +1739,80 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         // MMA 7 retired on slot 1 (cols 496..511); start K=64 tail on sf_slot=0 (cols 480..491).
                         if (k_block_idx > 0u)
                             sf_slot_counter = 0u;
+                    }
+                }
+#elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1070)
+                if constexpr (kCanUseSM107K128) {
+                    // SM107 K=128 FP4 mainloop: 2 MMAs per BLOCK_K=256 stage (no cross-stage grouping).
+                    // {k_size_upper_=bit3, k_size_lower_=bit31} = {1, 0} selects dense K=128.
+                    auto instr_desc_k128 = instr_desc;
+                    instr_desc_k128.desc_ = (instr_desc.desc_ & ~(1u << 31u)) | (1u << 3u);
+                    const uint32_t sfa_chunk_stride = (umma_n > 128u) ? 8u : 4u;
+                    const uint64_t runtime_idesc_k128 =
+                        mma::sm100::make_runtime_instr_desc_with_sf_id(instr_desc_k128, 0u, 0u);
+
+                    #pragma unroll 2
+                    for (; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
+                        shared_storage.full_barriers[stage_idx].wait(phase);
+                        ptx::tcgen05_after_thread_sync();
+
+                        const uint32_t a_desc_base_lo = a_desc_lo + stage_idx * sizeof(SharedStorage::smem_a[0]) / 16u;
+                        const uint32_t b_desc_base_lo = b_desc_lo + stage_idx * sizeof(SharedStorage::smem_b[0]) / 16u;
+                        if (cute::elect_one_sync()) {
+                            #pragma unroll
+                            for (uint32_t k_sub = 0u; k_sub < 2u; ++ k_sub) {
+                                const uint32_t slot = (k96_slot_counter++) % kNumK128SFSlots;
+                                const uint32_t slot_sfa = tmem_base + kTmemStartColOfSFA + slot * kNumK128ColsPerSlot;
+                                const uint32_t slot_sfb = slot_sfa + kK128ChunksPerMMA * kNumSFATmemCols;
+                                using cute_utccp_t = cute::SM100_UTCCP_4x32dp128bit_2cta;
+                                #pragma unroll
+                                for (uint32_t c = 0u; c < kK128ChunksPerMMA; ++ c) {
+                                    const uint32_t sf_chunk = k_sub * kK128ChunksPerMMA + c;
+                                    const uint32_t sfa_dst = slot_sfa + c * sfa_chunk_stride;
+                                    const uint32_t sfb_dst = slot_sfb + c * 4u;
+                                    #pragma unroll
+                                    for (uint32_t i = 0u; i < SF_BLOCK_M / kNumUTCCPAlignedElems; ++ i) {
+                                        if (i == 0u or i * kNumUTCCPAlignedElems < task_info.valid_m) {
+                                            auto smem_ptr = shared_storage.smem_sfa[stage_idx] + sf_chunk * SF_BLOCK_M + i * kNumUTCCPAlignedElems;
+                                            mma::sm100::replace_smem_desc_addr(sf_desc, smem_ptr);
+                                            cute_utccp_t::copy(sf_desc, sfa_dst + i * 4u);
+                                        }
+                                    }
+                                    #pragma unroll
+                                    for (uint32_t i = 0u; i < SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i) {
+                                        auto smem_ptr = shared_storage.smem_sfb[stage_idx] +
+                                            ((kUseShuffledWeights or kUseInterleavedWeights)
+                                                ? i * (kNumSFWordsPerStage * kNumUTCCPAlignedElems) + sf_chunk * kNumUTCCPAlignedElems
+                                                : sf_chunk * SF_BLOCK_N + i * kNumUTCCPAlignedElems);
+                                        mma::sm100::replace_smem_desc_addr(sf_desc, smem_ptr);
+                                        cute_utccp_t::copy(sf_desc, sfb_dst + i * 4u);
+                                    }
+                                }
+                                // 128 FP4 elements = 64 bytes = 4 x 16B units inside the 128B swizzle atom
+                                a_desc.lo = a_desc_base_lo + k_sub * 4u;
+                                b_desc.lo = b_desc_base_lo + k_sub * 4u;
+                                if constexpr (kIsNVFP4) {
+                                    ptx::SM100_MMA_MXF4NVF4_2x1SM_SS::fma(
+                                        b_desc, a_desc, tmem_base + accum_stage_idx * UMMA_N,
+                                        k_block_idx > 0u or k_sub > 0u, runtime_idesc_k128,
+                                        slot_sfb, slot_sfa);
+                                } else {
+                                    asm volatile(
+                                        "{\n\t"
+                                        ".reg .pred p;\n\t"
+                                        "setp.ne.b32 p, %4, 0;\n\t"
+                                        "tcgen05.mma.cta_group::2.kind::mxf4nvf4.block_scale.block32 [%0], %1, %2, %3, [%5], [%6], p;\n\t"
+                                        "}\n"
+                                        :: "r"(tmem_base + accum_stage_idx * UMMA_N),
+                                           "l"(b_desc.desc_), "l"(a_desc.desc_),
+                                           "r"(static_cast<uint32_t>(runtime_idesc_k128 >> 32)),
+                                           "r"(static_cast<uint32_t>(k_block_idx > 0u or k_sub > 0u)),
+                                           "r"(slot_sfb), "r"(slot_sfa));
+                                }
+                            }
+                        }
+                        __syncwarp();
+                        empty_barrier_arrive_stage(stage_idx, k_block_idx == num_k_blocks - 1u);
                     }
                 }
 #endif

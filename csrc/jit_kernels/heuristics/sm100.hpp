@@ -24,6 +24,22 @@ struct SM107ArchSpec {
     static bool is_current() { return jit->device.get_arch_pair() == std::make_pair(10, 7); }
 };
 
+struct SM10xArchCaps {
+    bool has_mxf8f6f4_k64;    // SM107: K=64 `kind::mxf8f6f4` MMA (packed FP4 weights in FP8xFP4)
+    bool has_fp4_k96;         // SM103: K=96 `kind::mxf4nvf4.block_scale.block16` Ultra MMA
+    bool has_fp4_k128;        // SM107: K=128 `kind::mxf4nvf4.block_scale` MMA
+    int nvfp4_decode_block_m; // Decode M-tile for NVFP4 (128 on SM103/SM107, 64 on SM100)
+    bool prefer_simt_pull_packed; // Prefer SIMT dispatch pull when weight stages are packed FP4
+};
+
+static SM10xArchCaps get_sm10x_arch_caps() {
+    if (SM107ArchSpec::is_current())
+        return {true, false, true, 128, true};
+    if (SM103ArchSpec::is_current())
+        return {false, true, false, 128, true};
+    return {false, false, false, 64, false};
+}
+
 struct SM100ArchSpec {
     static constexpr int smem_capacity = 232448;
 

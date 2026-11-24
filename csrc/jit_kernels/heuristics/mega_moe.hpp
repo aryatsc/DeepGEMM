@@ -50,8 +50,9 @@ struct MegaMoEConfig {
     // Dispatch pull config
     int num_bytes_per_pull;
 
-    // SM107 K=64 `kind::mxf8f6f4` MMAs, SM103 K=96 `kind::mxf4nvf4` Ultra MMAs, and the SIMT dispatch pull
-    bool use_sm107_k64, use_sm103_k96, use_simt_pull;
+    // UMMA K-width (32/64 for MXF8F6F4, 64/96/128 for MXF4/NVF4) and the SIMT dispatch pull
+    int umma_k;
+    bool use_simt_pull;
 
     friend std::ostream& operator << (std::ostream& os, const MegaMoEConfig& config) {
         os << "MegaMoEConfig("
@@ -68,8 +69,7 @@ struct MegaMoEConfig {
            << ", num_non_epilogue_threads=" << config.num_non_epilogue_threads
            << ", num_epilogue_threads=" << config.num_epilogue_threads
            << ", num_bytes_per_pull=" << config.num_bytes_per_pull
-           << ", use_sm107_k64=" << config.use_sm107_k64
-           << ", use_sm103_k96=" << config.use_sm103_k96
+           << ", umma_k=" << config.umma_k
            << ", use_simt_pull=" << config.use_simt_pull << ")";
         return os;
     }
@@ -208,7 +208,8 @@ static std::tuple<int, int, int, int, int, int> get_block_config_for_mega_moe(
     // A single 240-row block per expert only pays off with many local experts (about 14 or more blocks per rank).
     // Decode-sized loads use 64 rows: real routing concentrates on a few hot experts, which smaller tiles split
     // into several M blocks. At most 2 expected tokens keep 16, where 64 rows lose under any routing.
-    int block_m = num_expected_tokens <= 2 ? 16 : (SM103ArchSpec::is_current() and mma_kind == MmaKind::NVFP4 ? 128 : 64);
+    const auto arch_caps = get_sm10x_arch_caps();
+    int block_m = num_expected_tokens <= 2 ? 16 : (mma_kind == MmaKind::NVFP4 ? arch_caps.nvfp4_decode_block_m : 64);
     if (num_expected_tokens > 24) {
         int num_blocks = static_cast<int>(std::ceil(num_covered_tokens / 240));
         if (num_blocks == 1 and num_covered_tokens > 192 and num_experts / num_ranks < 14)
@@ -366,27 +367,38 @@ static MegaMoEConfig get_mega_moe_config(
         num_bytes_per_pull /= 2;
     }
 
-    // SM107 (CC 10.7) has a K=64 `kind::mxf8f6f4` MMA, which reads FP4 operands packed: FP8 x FP4 then loads its
-    // routed weights packed and splits the FP8 shared expert's K blocks. `DG_MEGA_MOE_SM107_K64=0` disables it
-    const bool use_sm107_k64 = fp4_weights and mma_kind == MmaKind::MXFP8FP4 and block_k == 128 and gran_k == 32 and
-        SM107ArchSpec::is_current() and deep_jit::get_env<int>("DG_MEGA_MOE_SM107_K64", 1) != 0;
-    // SM103 (CC 10.3, Blackwell Ultra) has a K=96 `kind::mxf4nvf4.block_scale.block16` MMA (1.5x per-instruction K
-    // width over K=64) spanning 3-stage 768-element groups via `lbo_mode=1` (`block_m <= 192` uses 3-chunk TMEM SF
-    // slots; `block_m == 240` uses a compact 32-col double-buffered 2-chunk TMEM SF ring when `umma_n <= 128` and
-    // 2-slot double-buffered K=64 otherwise). Asymmetric store tiles on `block_m == 192` fit a 6-stage (2x3) pipeline.
-    const bool use_sm103_k96 = mma_kind == MmaKind::NVFP4 and block_k == 256 and gran_k == 16 and block_m <= 240 and
-        SM103ArchSpec::is_current() and deep_jit::get_env<int>("DG_MEGA_MOE_SM103_K96", 1) != 0;
-    if (use_sm103_k96 and block_m == 192 and deep_jit::get_env<std::string>("DG_MEGA_MOE_TILES").empty()) {
+    const auto arch_caps = get_sm10x_arch_caps();
+
+    // Select UMMA K-width from architecture capabilities and MMA kind:
+    // - SM107 MXF8F6F4 (FP8 x FP4, gran_k=32): K=64 (reads FP4 weights packed, `DG_MEGA_MOE_SM107_K64=0` disables)
+    // - SM107 MXF4/NVF4 (block_k=256): K=128 (2 MMAs/stage, `DG_MEGA_MOE_SM107_K128=0` disables)
+    // - SM103 NVFP4 (block_k=256, gran_k=16): K=96 Ultra MMA (3-stage 768-elem groups, `DG_MEGA_MOE_SM103_K96=0` disables)
+    const int base_umma_k = 32 * 8 / get_element_bits(mma_kind);
+    int umma_k = base_umma_k;
+    if (fp4_weights and mma_kind == MmaKind::MXFP8FP4 and block_k == 128 and gran_k == 32 and
+        arch_caps.has_mxf8f6f4_k64 and deep_jit::get_env<int>("DG_MEGA_MOE_SM107_K64", 1) != 0) {
+        umma_k = 64;
+    } else if ((mma_kind == MmaKind::NVFP4 or mma_kind == MmaKind::MXFP4) and block_k == 256 and block_m <= 240 and
+               arch_caps.has_fp4_k128 and deep_jit::get_env<int>("DG_MEGA_MOE_SM107_K128", 1) != 0) {
+        umma_k = 128;
+    } else if (mma_kind == MmaKind::NVFP4 and block_k == 256 and gran_k == 16 and block_m <= 240 and
+               arch_caps.has_fp4_k96 and deep_jit::get_env<int>("DG_MEGA_MOE_SM103_K96", 1) != 0) {
+        umma_k = 96;
+    }
+    const bool use_packed_fp4_k64 = (mma_kind == MmaKind::MXFP8FP4 and umma_k == 64);
+    if (mma_kind == MmaKind::NVFP4 and umma_k == 96 and block_m == 192 and deep_jit::get_env<std::string>("DG_MEGA_MOE_TILES").empty()) {
         store_block_m_l1 = 32;
         store_block_m_l2 = 8;
     }
     // The SIMT dispatch pull loads each token with one remote round trip instead of chunked TMA copies through the
-    // SMEM send buffers. It needs the normal SMEM budget, so it is on by default on CC 10.7 only with packed FP4
-    // weight stages: FP4 activations, or FP8 x FP4 with the K=64 MMA. `DG_MEGA_MOE_SIMT_PULL=0/1` forces it
+    // SMEM send buffers. It needs the normal SMEM budget, so it is on by default on SM107 with packed FP4 weight
+    // stages and on SM103 NVFP4. `DG_MEGA_MOE_SIMT_PULL=0/1` forces it.
     const int simt_pull_env = deep_jit::get_env<int>("DG_MEGA_MOE_SIMT_PULL", -1);
-    const bool packed_weight_stages = use_sm107_k64 or mma_kind != MmaKind::MXFP8FP4;
+    const bool packed_weight_stages = use_packed_fp4_k64 or mma_kind != MmaKind::MXFP8FP4;
+    const bool default_simt_pull = arch_caps.prefer_simt_pull_packed and
+        (arch_caps.has_mxf8f6f4_k64 ? packed_weight_stages : mma_kind == MmaKind::NVFP4);
     const bool use_simt_pull = is_mma_with_sf(mma_kind) and num_token_bytes % 512 == 0 and
-        (simt_pull_env >= 0 ? simt_pull_env != 0 : (SM107ArchSpec::is_current() and packed_weight_stages) or (SM103ArchSpec::is_current() and mma_kind == MmaKind::NVFP4));
+        (simt_pull_env >= 0 ? simt_pull_env != 0 : default_simt_pull);
 
     // Pipeline
     const auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe(
@@ -395,7 +407,7 @@ static MegaMoEConfig get_mega_moe_config(
         block_m, block_n, block_k, num_bytes_per_pull, store_block_m_l1, store_block_m_l2,
         sf_block_m, sf_block_n, gran_k,
         num_dispatch_threads / 32, num_epilogue_threads / 32,
-        mma_kind, use_sm107_k64, use_simt_pull);
+        mma_kind, use_packed_fp4_k64, use_simt_pull);
 
     const auto config = MegaMoEConfig {
         block_m, block_n, block_k,
@@ -406,7 +418,7 @@ static MegaMoEConfig get_mega_moe_config(
         num_stages, smem_size,
         num_dispatch_threads, num_non_epilogue_threads, num_epilogue_threads,
         num_bytes_per_pull,
-        use_sm107_k64, use_sm103_k96, use_simt_pull
+        umma_k, use_simt_pull
     };
 
     // Print configs for the first time
