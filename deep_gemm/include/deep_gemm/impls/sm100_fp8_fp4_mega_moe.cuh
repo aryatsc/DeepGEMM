@@ -1797,17 +1797,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                         k_block_idx > 0u or k_sub > 0u, runtime_idesc_k128,
                                         slot_sfb, slot_sfa);
                                 } else {
-                                    asm volatile(
-                                        "{\n\t"
-                                        ".reg .pred p;\n\t"
-                                        "setp.ne.b32 p, %4, 0;\n\t"
-                                        "tcgen05.mma.cta_group::2.kind::mxf4nvf4.block_scale.block32 [%0], %1, %2, %3, [%5], [%6], p;\n\t"
-                                        "}\n"
-                                        :: "r"(tmem_base + accum_stage_idx * UMMA_N),
-                                           "l"(b_desc.desc_), "l"(a_desc.desc_),
-                                           "r"(static_cast<uint32_t>(runtime_idesc_k128 >> 32)),
-                                           "r"(static_cast<uint32_t>(k_block_idx > 0u or k_sub > 0u)),
-                                           "r"(slot_sfb), "r"(slot_sfa));
+                                    ptx::SM100_MMA_MXF4NVF4_BLOCK32_2x1SM_SS::fma(
+                                        b_desc, a_desc, tmem_base + accum_stage_idx * UMMA_N,
+                                        k_block_idx > 0u or k_sub > 0u, runtime_idesc_k128,
+                                        slot_sfb, slot_sfa);
                                 }
                             }
                         }

@@ -209,21 +209,16 @@ static std::tuple<int, int, int, int, int, int> get_block_config_for_mega_moe(
     // Every M block costs roughly 128 extra rows (its tasks reload the weight tiles), so use the fewest blocks
     // per expert and the smallest tile covering them: one block up to 192 rows, then blocks of up to 240 rows.
     // A single 240-row block per expert only pays off with many local experts (about 14 or more blocks per rank).
-    // Decode-sized loads use 64 rows: real routing concentrates on a few hot experts, which smaller tiles split
-    // into several M blocks. At most 2 expected tokens keep 16, where 64 rows lose under any routing.
+    // Decode-sized loads use 128 rows for NVFP4 on SM103/SM107 and 64 otherwise; at most 2 expected tokens use 16.
     const auto arch_caps = get_sm10x_arch_caps();
-    int block_m = num_expected_tokens <= 2 ? 16 : (mma_kind == MmaKind::NVFP4 ? arch_caps.nvfp4_decode_block_m : 64);
+    const int decode_block_m = mma_kind == MmaKind::NVFP4 ? arch_caps.nvfp4_decode_block_m : 64;
+    int block_m = num_expected_tokens <= 2 ? 16 : decode_block_m;
     if (num_expected_tokens > 24) {
-        // On SM107 NVFP4 (K=128), block_m=240 leaves only 32 free TMEM cols (1 K=128 SF slot),
-        // serializing UTCCP and MMA. Capping at 224 leaves 64 free TMEM cols (2 K=128 SF slots)
-        // with 6 TMA stages (using store_block_m_l1=56, store_block_m_l2=8).
-        const bool sm107_nvfp4 = arch_caps.has_fp4_k128 and mma_kind == MmaKind::NVFP4;
-        const int max_bm = sm107_nvfp4 ? 224 : 240;
-        int num_blocks = static_cast<int>(std::ceil(num_covered_tokens / max_bm));
-        if (max_bm == 240 and num_blocks == 1 and num_covered_tokens > 192 and num_experts / num_ranks < 14)
+        int num_blocks = static_cast<int>(std::ceil(num_covered_tokens / 240));
+        if (num_blocks == 1 and num_covered_tokens > 192 and num_experts / num_ranks < 14)
             num_blocks = 2;
-        for (const int& candidate: {64, 128, 192, 224, 240}) {
-            if (candidate > max_bm or (candidate == 224 and not sm107_nvfp4))
+        for (const int& candidate: {64, 128, 192, 240}) {
+            if (candidate < decode_block_m)
                 continue;
             block_m = candidate;
             if (num_blocks * candidate >= num_covered_tokens)
@@ -235,8 +230,8 @@ static std::tuple<int, int, int, int, int, int> get_block_config_for_mega_moe(
     // 128 -> 64 cannot take 48, 192 -> 96 can and halves its store iterations.
     // Use smaller, asymmetric store blocks at FP8xFP4 prefill to save shared memory for sufficient TMA pipeline depth
     int store_block_m_l1 = block_m <= 16 ? 8 : block_m <= 64 ? 16 : block_m <= 128 ? 32 : block_m <= 192 ? 48 :
-                           block_m == 224 ? 56 : (mma_kind == MmaKind::MXFP8FP4 ? 24 : 40);
-    int store_block_m_l2 = (block_m == 224 or (block_m == 240 and mma_kind == MmaKind::MXFP8FP4)) ? 8 : store_block_m_l1;
+                           mma_kind == MmaKind::MXFP8FP4 ? 24 : 40;
+    int store_block_m_l2 = (block_m == 240 and mma_kind == MmaKind::MXFP8FP4) ? 8 : store_block_m_l1;
     int block_k = 128 * 8 / get_element_bits(mma_kind);
     int cluster_size = 2, num_epilogue_warpgroups = 2;
 
@@ -405,13 +400,12 @@ static MegaMoEConfig get_mega_moe_config(
         store_block_m_l1 = 32;
         store_block_m_l2 = umma_k == 96 ? 8 : 24;
     }
-    // The SIMT dispatch pull loads each token with one remote round trip instead of chunked TMA copies through the
-    // SMEM send buffers. It needs the normal SMEM budget, so it is on by default on SM107 with packed FP4 weight
-    // stages and on SM103 NVFP4. `DG_MEGA_MOE_SIMT_PULL=0/1` forces it.
+    // SIMT dispatch pull (normal SMEM budget): on by default on SM107 with packed FP4 weight stages
+    // and on SM103 NVFP4 decode (`block_m <= 128`). `DG_MEGA_MOE_SIMT_PULL=0/1` overrides.
     const int simt_pull_env = deep_jit::get_env<int>("DG_MEGA_MOE_SIMT_PULL", -1);
     const bool packed_weight_stages = use_packed_fp4_k64 or mma_kind != MmaKind::MXFP8FP4;
     const bool default_simt_pull = arch_caps.prefer_simt_pull_packed and
-        (arch_caps.has_mxf8f6f4_k64 ? packed_weight_stages : mma_kind == MmaKind::NVFP4);
+        (arch_caps.has_mxf8f6f4_k64 ? packed_weight_stages : (mma_kind == MmaKind::NVFP4 and block_m <= 128));
     const bool use_simt_pull = is_mma_with_sf(mma_kind) and num_token_bytes % 512 == 0 and
         (simt_pull_env >= 0 ? simt_pull_env != 0 : default_simt_pull);
 

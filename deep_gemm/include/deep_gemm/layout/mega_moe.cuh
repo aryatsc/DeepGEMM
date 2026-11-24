@@ -10,11 +10,11 @@
 
 namespace deep_gemm::layout {
 
-static constexpr int kNumCandidateBlockMs = 9;
-static constexpr int kCandidateBlockM[kNumCandidateBlockMs] = {8, 16, 32, 64, 96, 128, 192, 224, 240};
+static constexpr int kNumCandidateBlockMs = 8;
+static constexpr int kCandidateBlockM[kNumCandidateBlockMs] = {8, 16, 32, 64, 96, 128, 192, 240};
 static constexpr int kMaxCandidateBlockM = 240;
 static constexpr int kMinCandidateBlockM = 8;
-static constexpr int kLCMCandidateBlockM = 13440;
+static constexpr int kLCMCandidateBlockM = 1920;
 
 // Pool capacity for shared expert token pool: worst-case total tokens + per-expert BLOCK_M alignment padding, among all possible BLOCK_M
 template <typename T>

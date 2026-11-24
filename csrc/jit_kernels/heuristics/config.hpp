@@ -189,12 +189,14 @@ struct LayoutInfo {
     int last_wave_util;
     int64_t num_cycles;
     Layout layout;
+    int num_effective_m_blocks = 0;
 
     friend std::ostream& operator << (std::ostream& os, const LayoutInfo& config) {
         os << "LayoutInfo("
            << "num_waves=" << config.num_waves
-           << ", last_wave_util=" << config.last_wave_util 
-           << ", num_cycles=" << config.num_cycles << ")";
+           << ", last_wave_util=" << config.last_wave_util
+           << ", num_cycles=" << config.num_cycles
+           << ", num_effective_m_blocks=" << config.num_effective_m_blocks << ")";
         return os;
     }
 };
