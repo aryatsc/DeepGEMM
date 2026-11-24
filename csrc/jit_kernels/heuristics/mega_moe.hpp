@@ -79,8 +79,11 @@ struct MegaMoEConfig {
 // loads (5 KB per dispatch warp at hidden 5120): the SIMT pull keeps the normal budget
 static int get_smem_capacity_for_mega_moe(const int& block_m, const bool& use_simt_pull) {
 #if CUDA_VERSION >= 13040
-    if (SM107ArchSpec::is_current() and block_m != 240 and not use_simt_pull)
-        return SM107ArchSpec::oversized_smem_capacity;
+    if (SM107ArchSpec::is_current() and block_m != 240) {
+        const int ov_env = deep_jit::get_env<int>("DG_MEGA_MOE_OVERSIZED_SMEM", -1);
+        if (ov_env >= 0 ? ov_env != 0 : not use_simt_pull)
+            return SM107ArchSpec::oversized_smem_capacity;
+    }
 #endif
     return SM100ArchSpec::smem_capacity;
 }
@@ -211,10 +214,17 @@ static std::tuple<int, int, int, int, int, int> get_block_config_for_mega_moe(
     const auto arch_caps = get_sm10x_arch_caps();
     int block_m = num_expected_tokens <= 2 ? 16 : (mma_kind == MmaKind::NVFP4 ? arch_caps.nvfp4_decode_block_m : 64);
     if (num_expected_tokens > 24) {
-        int num_blocks = static_cast<int>(std::ceil(num_covered_tokens / 240));
-        if (num_blocks == 1 and num_covered_tokens > 192 and num_experts / num_ranks < 14)
+        // On SM107 NVFP4 (K=128), block_m=240 leaves only 32 free TMEM cols (1 K=128 SF slot),
+        // serializing UTCCP and MMA. Capping at 224 leaves 64 free TMEM cols (2 K=128 SF slots)
+        // with 6 TMA stages (using store_block_m_l1=56, store_block_m_l2=8).
+        const bool sm107_nvfp4 = arch_caps.has_fp4_k128 and mma_kind == MmaKind::NVFP4;
+        const int max_bm = sm107_nvfp4 ? 224 : 240;
+        int num_blocks = static_cast<int>(std::ceil(num_covered_tokens / max_bm));
+        if (max_bm == 240 and num_blocks == 1 and num_covered_tokens > 192 and num_experts / num_ranks < 14)
             num_blocks = 2;
-        for (const int& candidate: {64, 128, 192, 240}) {
+        for (const int& candidate: {64, 128, 192, 224, 240}) {
+            if (candidate > max_bm or (candidate == 224 and not sm107_nvfp4))
+                continue;
             block_m = candidate;
             if (num_blocks * candidate >= num_covered_tokens)
                 break;
@@ -225,20 +235,25 @@ static std::tuple<int, int, int, int, int, int> get_block_config_for_mega_moe(
     // 128 -> 64 cannot take 48, 192 -> 96 can and halves its store iterations.
     // Use smaller, asymmetric store blocks at FP8xFP4 prefill to save shared memory for sufficient TMA pipeline depth
     int store_block_m_l1 = block_m <= 16 ? 8 : block_m <= 64 ? 16 : block_m <= 128 ? 32 : block_m <= 192 ? 48 :
-                           mma_kind == MmaKind::MXFP8FP4 ? 24 : 40;
-    int store_block_m_l2 = (block_m == 240 and mma_kind == MmaKind::MXFP8FP4) ? 8 : store_block_m_l1;
+                           block_m == 224 ? 56 : (mma_kind == MmaKind::MXFP8FP4 ? 24 : 40);
+    int store_block_m_l2 = (block_m == 224 or (block_m == 240 and mma_kind == MmaKind::MXFP8FP4)) ? 8 : store_block_m_l1;
     int block_k = 128 * 8 / get_element_bits(mma_kind);
     int cluster_size = 2, num_epilogue_warpgroups = 2;
 
     // Offline tuning hook: "cluster,block_m,store_block_m,block_k,epilogue_warpgroups",
     // `block_k` in the pre-scaling 8-bit units above; `store_block_m` sets both L1 and L2.
     if (const auto override_str = deep_jit::get_env<std::string>("DG_MEGA_MOE_TILES"); not override_str.empty()) {
-        int v[5];
-        const int n = std::sscanf(override_str.c_str(), "%d,%d,%d,%d,%d",
-                                  v + 0, v + 1, v + 2, v + 3, v + 4);
-        DG_HOST_ASSERT(n == 5 and "DG_MEGA_MOE_TILES needs 5 comma-separated ints");
-        cluster_size = v[0], block_m = v[1], store_block_m_l1 = store_block_m_l2 = v[2];
-        block_k = v[3] * 8 / get_element_bits(mma_kind), num_epilogue_warpgroups = v[4];
+        int v[6];
+        const int n = std::sscanf(override_str.c_str(), "%d,%d,%d,%d,%d,%d",
+                                  v + 0, v + 1, v + 2, v + 3, v + 4, v + 5);
+        DG_HOST_ASSERT((n == 5 or n == 6) and "DG_MEGA_MOE_TILES needs 5 or 6 comma-separated ints");
+        if (n == 5) {
+            cluster_size = v[0], block_m = v[1], store_block_m_l1 = store_block_m_l2 = v[2];
+            block_k = v[3] * 8 / get_element_bits(mma_kind), num_epilogue_warpgroups = v[4];
+        } else {
+            cluster_size = v[0], block_m = v[1], store_block_m_l1 = v[2], store_block_m_l2 = v[3];
+            block_k = v[4] * 8 / get_element_bits(mma_kind), num_epilogue_warpgroups = v[5];
+        }
     }
 
     // Check whether our `block_m` lies in `kCandidateBlockM`
@@ -386,9 +401,9 @@ static MegaMoEConfig get_mega_moe_config(
         umma_k = 96;
     }
     const bool use_packed_fp4_k64 = (mma_kind == MmaKind::MXFP8FP4 and umma_k == 64);
-    if (mma_kind == MmaKind::NVFP4 and umma_k == 96 and block_m == 192 and deep_jit::get_env<std::string>("DG_MEGA_MOE_TILES").empty()) {
+    if (mma_kind == MmaKind::NVFP4 and (umma_k == 96 or umma_k == 128) and block_m == 192 and deep_jit::get_env<std::string>("DG_MEGA_MOE_TILES").empty()) {
         store_block_m_l1 = 32;
-        store_block_m_l2 = 8;
+        store_block_m_l2 = umma_k == 96 ? 8 : 24;
     }
     // The SIMT dispatch pull loads each token with one remote round trip instead of chunked TMA copies through the
     // SMEM send buffers. It needs the normal SMEM budget, so it is on by default on SM107 with packed FP4 weight
